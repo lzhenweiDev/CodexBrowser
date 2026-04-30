@@ -8,8 +8,45 @@ from pathlib import Path
 if "QTWEBENGINE_DISABLE_SANDBOX" not in os.environ:
     os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
 
-from PySide6.QtCore import QStandardPaths, QSize, Qt, QUrl
-from PySide6.QtGui import QAction, QKeySequence
+if getattr(sys, "frozen", False) and sys.platform == "darwin":
+    exe_path = Path(sys.executable).resolve()
+    bundle_contents = exe_path.parent.parent
+    qtwebengine_framework = (
+        bundle_contents
+        / "Frameworks"
+        / "PySide6"
+        / "Qt"
+        / "lib"
+        / "QtWebEngineCore.framework"
+    )
+    if qtwebengine_framework.exists():
+        qtwebengine_process = next(
+            qtwebengine_framework.glob("**/QtWebEngineProcess.app/Contents/MacOS/QtWebEngineProcess"),
+            None,
+        )
+        if qtwebengine_process is not None and qtwebengine_process.exists():
+            os.environ["QTWEBENGINEPROCESS_PATH"] = str(qtwebengine_process)
+
+        qtwebengine_resources = next(
+            qtwebengine_framework.glob("**/Resources"),
+            None,
+        )
+        if qtwebengine_resources is not None and qtwebengine_resources.exists():
+            # Qt sometimes expects resources directly under the framework Resources root,
+            # but PyInstaller may leave them nested under Resources/Resources.
+            nested_resources = qtwebengine_resources / "Resources"
+            if nested_resources.exists() and nested_resources.is_dir():
+                for child in nested_resources.iterdir():
+                    target = qtwebengine_resources / child.name
+                    if not target.exists():
+                        try:
+                            target.symlink_to(child)
+                        except OSError:
+                            pass
+            os.environ["QTWEBENGINE_RESOURCES_PATH"] = str(qtwebengine_resources)
+
+from PySide6.QtCore import QStandardPaths, QSize, Qt, QUrl, QEvent
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWebEngineCore import (
     QWebEngineDownloadRequest,
     QWebEnginePage,
@@ -27,19 +64,21 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QProgressBar,
     QSplitter,
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QToolButton,
 )
-
 
 APP_NAME = "CodexBrowser"
 MAX_HISTORY_ITEMS = 5000
 MAX_BOOKMARKS = 3000
 START_PAGE_URL = QUrl("codex://start")
 MAX_CLOSED_TABS = 25
-
+MAX_SESSION_TABS = 30
+MAX_DOWNLOAD_ITEMS = 500
 
 class BrowserPage(QWebEnginePage):
     def __init__(self, profile, browser_window, parent=None):
@@ -88,8 +127,9 @@ class BrowserWindow(QMainWindow):
         self.home_url = START_PAGE_URL
         self.webgl_enabled = True
         self.dark_mode_enabled = False
+        self.restore_session_enabled = True
         self.current_zoom = 1.0
-        self.data = {"bookmarks": [], "history": []}
+        self.data = {"bookmarks": [], "history": [], "settings": {}, "session": {}}
         self.data_file = self._resolve_data_file()
         self.profile_dir = self._resolve_profile_dir()
         self.download_dir = self._resolve_download_dir()
@@ -104,7 +144,7 @@ class BrowserWindow(QMainWindow):
         self._create_menus()
         self._create_toolbar()
         self._connect_signals()
-        self.add_new_tab(self.home_url, switch=True)
+        self._restore_startup_tabs()
         self._refresh_sidebar()
         self._update_window_title()
 
@@ -159,9 +199,23 @@ class BrowserWindow(QMainWindow):
         try:
             self.data = json.loads(self.data_file.read_text(encoding="utf-8"))
             if not isinstance(self.data, dict):
-                self.data = {"bookmarks": [], "history": []}
+                self.data = {
+                    "bookmarks": [],
+                    "history": [],
+                    "settings": {},
+                    "extensions": [],
+                    "downloads": [],
+                    "session": {},
+                }
         except Exception:
-            self.data = {"bookmarks": [], "history": []}
+            self.data = {
+                "bookmarks": [],
+                "history": [],
+                "settings": {},
+                "extensions": [],
+                "downloads": [],
+                "session": {},
+            }
         self._sanitize_data()
         self._load_settings()
 
@@ -177,7 +231,14 @@ class BrowserWindow(QMainWindow):
 
     def _sanitize_data(self):
         if not isinstance(self.data, dict):
-            self.data = {"bookmarks": [], "history": []}
+            self.data = {
+                "bookmarks": [],
+                "history": [],
+                "settings": {},
+                "extensions": [],
+                "downloads": [],
+                "session": {},
+            }
             return
 
         bookmarks = self.data.get("bookmarks", [])
@@ -185,11 +246,13 @@ class BrowserWindow(QMainWindow):
         settings = self.data.get("settings", {})
         extensions = self.data.get("extensions", [])
         downloads = self.data.get("downloads", [])
+        session = self.data.get("session", {})
         self.data["bookmarks"] = bookmarks if isinstance(bookmarks, list) else []
         self.data["history"] = history if isinstance(history, list) else []
         self.data["settings"] = settings if isinstance(settings, dict) else {}
         self.data["extensions"] = extensions if isinstance(extensions, list) else []
         self.data["downloads"] = downloads if isinstance(downloads, list) else []
+        self.data["session"] = session if isinstance(session, dict) else {}
 
     def _load_settings(self):
         settings = self.data.get("settings", {})
@@ -207,6 +270,7 @@ class BrowserWindow(QMainWindow):
 
         self.webgl_enabled = bool(settings.get("webgl_enabled", True))
         self.dark_mode_enabled = bool(settings.get("dark_mode_enabled", False))
+        self.restore_session_enabled = bool(settings.get("restore_session_enabled", True))
 
     def _persist_setting(self, key, value):
         if self.private_mode:
@@ -223,10 +287,18 @@ class BrowserWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-        self.progress_label = QLabel("")
+        self.progress_label = QLabel("Bereit")
         self.progress_label.setMinimumWidth(90)
         self.progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.status_bar.addPermanentWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setMaximumWidth(180)
+        self.progress_bar.hide()
+        self.status_bar.addPermanentWidget(self.progress_bar)
 
         self.splitter = QSplitter(Qt.Horizontal)
         self.sidebar = QListWidget()
@@ -240,6 +312,7 @@ class BrowserWindow(QMainWindow):
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setElideMode(Qt.ElideRight)
+        self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
 
         self.splitter.addWidget(self.sidebar)
         self.splitter.addWidget(self.tabs)
@@ -248,9 +321,26 @@ class BrowserWindow(QMainWindow):
         self.setCentralWidget(self.splitter)
 
         self.urlbar = QLineEdit()
-        self.urlbar.setClearButtonEnabled(True)
+        self.urlbar.setClearButtonEnabled(False)
+        self.urlbar.setTextMargins(14, 0, 44, 0)
         self.urlbar.setMinimumWidth(520)
         self.urlbar.setPlaceholderText("Suchbegriff oder URL eingeben")
+
+        self.urlbar_clear_button = QToolButton(self.urlbar)
+        self.urlbar_clear_button.setText("✕")
+        self.urlbar_clear_button.setCursor(Qt.ArrowCursor)
+        self.urlbar_clear_button.setStyleSheet(
+            "QToolButton { border: none; background: transparent; font-size: 14px; color: #7f8fa4; }"
+        )
+        self.urlbar_clear_button.setFixedSize(18, 18)
+        self.urlbar_clear_button.clicked.connect(self.urlbar.clear)
+        self.urlbar_clear_button.hide()
+        self.urlbar.textChanged.connect(
+            lambda text: self.urlbar_clear_button.setVisible(bool(text))
+        )
+        self.urlbar.installEventFilter(self)
+        self._position_urlbar_clear_button()
+
         self._apply_styles()
 
     def _create_actions(self):
@@ -289,6 +379,48 @@ class BrowserWindow(QMainWindow):
         self.new_window_action.setShortcut(QKeySequence("Ctrl+N"))
         self.new_window_action.triggered.connect(self.open_new_window)
 
+        # symbol-only toolbar actions
+        self.back_button_action = QAction("◀", self)
+        self.back_button_action.setStatusTip("Zurück")
+        self.back_button_action.setToolTip("Zurück")
+        self.back_button_action.triggered.connect(lambda: self.current_view().back())
+
+        self.forward_button_action = QAction("▶", self)
+        self.forward_button_action.setStatusTip("Vorwärts")
+        self.forward_button_action.setToolTip("Vorwärts")
+        self.forward_button_action.triggered.connect(lambda: self.current_view().forward())
+
+        self.reload_button_action = QAction("⟳", self)
+        self.reload_button_action.setStatusTip("Neu laden")
+        self.reload_button_action.setToolTip("Neu laden")
+        self.reload_button_action.setShortcut(QKeySequence.StandardKey.Refresh)
+        self.reload_button_action.triggered.connect(lambda: self.current_view().reload())
+
+        self.stop_button_action = QAction("⨯", self)
+        self.stop_button_action.setStatusTip("Stopp")
+        self.stop_button_action.setToolTip("Stopp")
+        self.stop_button_action.triggered.connect(lambda: self.current_view().stop())
+
+        self.home_button_action = QAction("⌂", self)
+        self.home_button_action.setStatusTip("Startseite")
+        self.home_button_action.setToolTip("Startseite")
+        self.home_button_action.triggered.connect(self.navigate_home)
+
+        self.command_palette_button_action = QAction("⌨", self)
+        self.command_palette_button_action.setStatusTip("Befehlspalette")
+        self.command_palette_button_action.setToolTip("Befehlspalette")
+        self.command_palette_button_action.triggered.connect(self.open_command_palette)
+
+        self.new_tab_button_action = QAction("✚", self)
+        self.new_tab_button_action.setStatusTip("Neuer Tab")
+        self.new_tab_button_action.setToolTip("Neuer Tab")
+        self.new_tab_button_action.triggered.connect(lambda: self.add_new_tab(self.home_url, switch=True))
+
+        self.add_bookmark_button_action = QAction("★", self)
+        self.add_bookmark_button_action.setStatusTip("Lesezeichen hinzufügen")
+        self.add_bookmark_button_action.setToolTip("Lesezeichen hinzufügen")
+        self.add_bookmark_button_action.triggered.connect(self.add_bookmark)
+
         self.private_window_action = QAction("Neues privates Fenster", self)
         self.private_window_action.setShortcut(QKeySequence("Ctrl+Shift+N"))
         self.private_window_action.triggered.connect(self.open_private_window)
@@ -300,6 +432,14 @@ class BrowserWindow(QMainWindow):
         self.focus_urlbar_action = QAction("Adressleiste fokussieren", self)
         self.focus_urlbar_action.setShortcut(QKeySequence("Ctrl+L"))
         self.focus_urlbar_action.triggered.connect(self.focus_urlbar)
+
+        self.command_palette_action = QAction("Befehlspalette", self)
+        self.command_palette_action.setShortcut(QKeySequence("Ctrl+K"))
+        self.command_palette_action.triggered.connect(self.open_command_palette)
+
+        self.tab_search_action = QAction("Tabs durchsuchen", self)
+        self.tab_search_action.setShortcut(QKeySequence("Ctrl+Shift+K"))
+        self.tab_search_action.triggered.connect(self.search_tabs)
 
         self.zoom_in_action = QAction("Zoom +", self)
         self.zoom_in_action.setShortcut(QKeySequence.ZoomIn)
@@ -328,6 +468,10 @@ class BrowserWindow(QMainWindow):
         self.show_download_history_action = QAction("Download-Verlauf anzeigen", self)
         self.show_download_history_action.triggered.connect(self.show_download_history)
 
+        self.open_download_folder_action = QAction("Download-Ordner öffnen", self)
+        self.open_download_folder_action.setShortcut(QKeySequence("Ctrl+J"))
+        self.open_download_folder_action.triggered.connect(self.open_download_folder)
+
         self.clear_download_history_action = QAction("Download-Verlauf löschen", self)
         self.clear_download_history_action.triggered.connect(self.clear_download_history)
 
@@ -352,6 +496,11 @@ class BrowserWindow(QMainWindow):
         self.dark_mode_action.setCheckable(True)
         self.dark_mode_action.setChecked(self.dark_mode_enabled)
         self.dark_mode_action.triggered.connect(self.set_dark_mode_enabled)
+
+        self.restore_session_action = QAction("Session beim Start wiederherstellen", self)
+        self.restore_session_action.setCheckable(True)
+        self.restore_session_action.setChecked(self.restore_session_enabled)
+        self.restore_session_action.triggered.connect(self.set_restore_session_enabled)
 
         self.save_page_action = QAction("Seite speichern unter...", self)
         self.save_page_action.setShortcut(QKeySequence.Save)
@@ -425,6 +574,10 @@ class BrowserWindow(QMainWindow):
         self.reload_all_tabs_action.setShortcut(QKeySequence("Ctrl+Shift+R"))
         self.reload_all_tabs_action.triggered.connect(self.reload_all_tabs)
 
+        self.shortcuts_help_action = QAction("Tastenkürzel anzeigen", self)
+        self.shortcuts_help_action.setShortcut(QKeySequence("Ctrl+/"))
+        self.shortcuts_help_action.triggered.connect(self.show_shortcuts_help)
+
     def _create_menus(self):
         menu_bar = self.menuBar()
 
@@ -441,6 +594,7 @@ class BrowserWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.duplicate_tab_action)
         file_menu.addAction(self.reopen_tab_action)
+        file_menu.addAction(self.command_palette_action)
         file_menu.addSeparator()
         file_menu.addAction(self.close_tab_action)
 
@@ -453,6 +607,7 @@ class BrowserWindow(QMainWindow):
         nav_menu.addSeparator()
         nav_menu.addAction(self.find_action)
         nav_menu.addAction(self.focus_urlbar_action)
+        nav_menu.addAction(self.tab_search_action)
         nav_menu.addAction(self.copy_url_action)
         nav_menu.addAction(self.view_source_action)
         nav_menu.addAction(self.reload_all_tabs_action)
@@ -476,6 +631,7 @@ class BrowserWindow(QMainWindow):
         history_menu = menu_bar.addMenu("Verlauf")
         history_menu.addAction(self.clear_history_action)
         history_menu.addAction(self.show_download_history_action)
+        history_menu.addAction(self.open_download_folder_action)
         history_menu.addAction(self.clear_download_history_action)
 
         ext_menu = menu_bar.addMenu("Erweiterungen")
@@ -489,25 +645,30 @@ class BrowserWindow(QMainWindow):
         settings_menu.addAction(self.downloads_action)
         settings_menu.addAction(self.toggle_webgl_action)
         settings_menu.addAction(self.dark_mode_action)
+        settings_menu.addAction(self.restore_session_action)
         settings_menu.addAction(self.clear_site_data_action)
+
+        help_menu = menu_bar.addMenu("Hilfe")
+        help_menu.addAction(self.shortcuts_help_action)
 
     def _create_toolbar(self):
         nav = QToolBar("Navigation")
         self.nav_toolbar = nav
         nav.setMovable(False)
-        nav.setIconSize(QSize(16, 16))
+        nav.setIconSize(QSize(18, 18))
         self.addToolBar(nav)
 
-        nav.addAction(self.back_action)
-        nav.addAction(self.forward_action)
-        nav.addAction(self.reload_action)
-        nav.addAction(self.stop_action)
-        nav.addAction(self.home_action)
+        nav.addAction(self.back_button_action)
+        nav.addAction(self.forward_button_action)
+        nav.addAction(self.reload_button_action)
+        nav.addAction(self.stop_button_action)
+        nav.addAction(self.home_button_action)
         nav.addSeparator()
         nav.addWidget(self.urlbar)
         nav.addSeparator()
-        nav.addAction(self.new_tab_action)
-        nav.addAction(self.add_bookmark_action)
+        nav.addAction(self.command_palette_button_action)
+        nav.addAction(self.new_tab_button_action)
+        nav.addAction(self.add_bookmark_button_action)
 
     def _apply_styles(self):
         if self.dark_mode_enabled:
@@ -535,10 +696,12 @@ class BrowserWindow(QMainWindow):
                     background: #1a2944;
                     border: 1px solid #2f456a;
                     border-radius: 11px;
-                    padding: 8px 13px;
+                    padding: 8px 12px;
                     font-weight: 600;
+                    font-size: 14px;
                     color: #d9e8ff;
                     min-width: 30px;
+                    min-height: 30px;
                 }
                 QToolButton:hover { background: #233657; border: 1px solid #4a6798; }
                 QToolButton:pressed { background: #30486f; }
@@ -546,9 +709,20 @@ class BrowserWindow(QMainWindow):
                     background: #131f36;
                     border: 1px solid #344c73;
                     border-radius: 14px;
-                    padding: 10px 14px;
+                    padding: 10px 52px 10px 14px;
                     color: #ecf3ff;
                     selection-background-color: #2f6fda;
+                }
+                QLineEdit::clear-button {
+                    subcontrol-origin: content;
+                    subcontrol-position: right center;
+                    margin: 0 6px 0 0;
+                    width: 18px;
+                    height: 18px;
+                }
+                QLineEdit::clear-button:hover {
+                    background: rgba(255, 255, 255, 0.12);
+                    border-radius: 9px;
                 }
                 QLineEdit:focus { border: 1px solid #68a0ff; }
                 QTabWidget::pane {
@@ -562,14 +736,29 @@ class BrowserWindow(QMainWindow):
                     border-bottom: none;
                     border-top-left-radius: 11px;
                     border-top-right-radius: 11px;
-                    padding: 10px 15px;
+                    padding: 10px 12px 10px 15px;
                     margin-right: 5px;
                     color: #bdd2f6;
+                }
+                QTabBar::close-button {
+                    subcontrol-origin: padding;
+                    subcontrol-position: right center;
+                    margin: 0 2px 0 0;
+                    width: 16px;
+                    height: 16px;
+                }
+                QTabBar::close-button:hover {
+                    background: rgba(255, 255, 255, 0.12);
+                    border-radius: 8px;
                 }
                 QTabBar::tab:selected {
                     background: #101a2f;
                     color: #eef4ff;
                     border-color: #5d83be;
+                }
+                QTabBar::tab:hover {
+                    background: #223454;
+                    color: #f2f7ff;
                 }
                 QListWidget {
                     background: #111b30;
@@ -593,6 +782,19 @@ class BrowserWindow(QMainWindow):
                     background: #111c33;
                     border-top: 1px solid #24344e;
                     color: #bcd0f0;
+                }
+                QProgressBar {
+                    border: 1px solid #31507b;
+                    border-radius: 7px;
+                    background: #1a2942;
+                    min-height: 10px;
+                }
+                QProgressBar::chunk {
+                    border-radius: 6px;
+                    background: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 0,
+                        stop: 0 #5b8bd5, stop: 1 #79b0ff
+                    );
                 }
                 """
             )
@@ -631,10 +833,12 @@ class BrowserWindow(QMainWindow):
                 background: #ffffff;
                 border: 1px solid #c4d4ea;
                 border-radius: 11px;
-                padding: 8px 13px;
+                padding: 8px 12px;
                 font-weight: 600;
+                font-size: 14px;
                 color: #11284d;
                 min-width: 30px;
+                min-height: 30px;
             }
             QToolButton:hover {
                 background: #edf4ff;
@@ -647,9 +851,20 @@ class BrowserWindow(QMainWindow):
                 background: #ffffff;
                 border: 1px solid #bfd0e8;
                 border-radius: 14px;
-                padding: 10px 14px;
+                padding: 10px 52px 10px 14px;
                 color: #0f1f3d;
                 selection-background-color: #2f6fda;
+            }
+            QLineEdit::clear-button {
+                subcontrol-origin: content;
+                subcontrol-position: right center;
+                margin: 0 6px 0 0;
+                width: 18px;
+                height: 18px;
+            }
+            QLineEdit::clear-button:hover {
+                background: rgba(0, 0, 0, 0.08);
+                border-radius: 9px;
             }
             QLineEdit:focus {
                 border: 1px solid #2f6fda;
@@ -666,14 +881,29 @@ class BrowserWindow(QMainWindow):
                 border-bottom: none;
                 border-top-left-radius: 11px;
                 border-top-right-radius: 11px;
-                padding: 10px 15px;
+                padding: 10px 12px 10px 15px;
                 margin-right: 5px;
                 color: #31496e;
+            }
+            QTabBar::close-button {
+                subcontrol-origin: padding;
+                subcontrol-position: right center;
+                margin: 0 2px 0 0;
+                width: 16px;
+                height: 16px;
+            }
+            QTabBar::close-button:hover {
+                background: rgba(0, 0, 0, 0.08);
+                border-radius: 8px;
             }
             QTabBar::tab:selected {
                 background: #fbfdff;
                 color: #0f1f3d;
                 border-color: #a7bfdf;
+            }
+            QTabBar::tab:hover {
+                background: #dfeaff;
+                color: #1a355c;
             }
             QListWidget {
                 background: #f3f8ff;
@@ -700,6 +930,19 @@ class BrowserWindow(QMainWindow):
                 border-top: 1px solid #c9d8eb;
                 color: #3a5378;
             }
+            QProgressBar {
+                border: 1px solid #b7cae4;
+                border-radius: 7px;
+                background: #eef4fd;
+                min-height: 10px;
+            }
+            QProgressBar::chunk {
+                border-radius: 6px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #6fa0e6, stop: 1 #4f84cf
+                );
+            }
             """
         )
 
@@ -707,7 +950,21 @@ class BrowserWindow(QMainWindow):
         self.urlbar.returnPressed.connect(self.navigate_to_input)
         self.tabs.currentChanged.connect(self._on_current_tab_changed)
         self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabBar().customContextMenuRequested.connect(self._show_tab_context_menu)
         self.sidebar.itemActivated.connect(self._open_sidebar_item)
+
+    def eventFilter(self, obj, event):
+        if obj is self.urlbar and event.type() == QEvent.Resize:
+            self._position_urlbar_clear_button()
+        return super().eventFilter(obj, event)
+
+    def _position_urlbar_clear_button(self):
+        if not hasattr(self, "urlbar_clear_button"):
+            return
+        btn = self.urlbar_clear_button
+        x = self.urlbar.width() - btn.width() - 10
+        y = (self.urlbar.height() - btn.height()) // 2
+        btn.move(max(0, x), max(0, y))
 
     def _update_window_title(self):
         current = self.current_view()
@@ -720,6 +977,77 @@ class BrowserWindow(QMainWindow):
         if isinstance(widget, QWebEngineView):
             return widget
         return None
+
+    def _restore_startup_tabs(self):
+        if self.private_mode or not self.restore_session_enabled:
+            self.add_new_tab(self.home_url, switch=True)
+            return
+
+        session = self.data.get("session", {})
+        tabs = session.get("tabs", [])
+        if not isinstance(tabs, list) or not tabs:
+            self.add_new_tab(self.home_url, switch=True)
+            return
+
+        for entry in tabs[:MAX_SESSION_TABS]:
+            if isinstance(entry, dict):
+                url_raw = str(entry.get("url", "")).strip()
+                pinned = bool(entry.get("pinned", False))
+            else:
+                url_raw = str(entry).strip()
+                pinned = False
+            if not url_raw:
+                continue
+            view = self.add_new_tab(url_raw, switch=False, label="Wiederhergestellt")
+            if view:
+                view.setProperty("pinned", pinned)
+                self._update_tab_title(view)
+
+        if self.tabs.count() == 0:
+            self.add_new_tab(self.home_url, switch=True)
+            return
+
+        current_index = session.get("current_index", 0)
+        if not isinstance(current_index, int):
+            current_index = 0
+        current_index = max(0, min(current_index, self.tabs.count() - 1))
+        self.tabs.setCurrentIndex(current_index)
+        self.status_bar.showMessage("Vorherige Session wiederhergestellt.", 2500)
+
+    def _save_session_state(self):
+        if self.private_mode or not self.restore_session_enabled:
+            return
+        tabs = []
+        for idx in range(self.tabs.count()):
+            tab = self.tabs.widget(idx)
+            if not isinstance(tab, QWebEngineView):
+                continue
+            url_text = tab.url().toString()
+            if not url_text:
+                continue
+            tabs.append({"url": url_text, "pinned": bool(tab.property("pinned"))})
+
+        self.data["session"] = {
+            "tabs": tabs[:MAX_SESSION_TABS],
+            "current_index": self.tabs.currentIndex(),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save_data()
+
+    def set_restore_session_enabled(self, enabled):
+        self.restore_session_enabled = bool(enabled)
+        self._persist_setting("restore_session_enabled", self.restore_session_enabled)
+        if not self.restore_session_enabled:
+            self.data["session"] = {}
+            self._save_data()
+            self.status_bar.showMessage("Session-Wiederherstellung deaktiviert.", 2500)
+            return
+        self._save_session_state()
+        self.status_bar.showMessage("Session-Wiederherstellung aktiviert.", 2500)
+
+    def closeEvent(self, event):
+        self._save_session_state()
+        super().closeEvent(event)
 
     def add_new_tab(self, url=None, switch=True, label="Neuer Tab"):
         if url is None:
@@ -782,8 +1110,17 @@ class BrowserWindow(QMainWindow):
         idx = self.tabs.indexOf(view)
         if idx == -1:
             return
+        pinned = bool(view.property("pinned"))
+        self._set_tab_pinned(idx, pinned)
+
+    def _set_tab_pinned(self, index, pinned, show_message=True):
+        view = self.tabs.widget(index)
+        if not isinstance(view, QWebEngineView):
+            return
+        pinned = bool(pinned)
+        view.setProperty("pinned", pinned)
         title = self._tab_label_text(view)
-        self.tabs.setTabText(idx, title[:32])
+        self.tabs.setTabText(index, title[:32])
         if view is self.current_view():
             self._update_window_title()
 
@@ -834,6 +1171,71 @@ class BrowserWindow(QMainWindow):
     def focus_urlbar(self):
         self.urlbar.setFocus()
         self.urlbar.selectAll()
+
+    def open_command_palette(self):
+        actions = [
+            ("Neuer Tab", lambda: self.add_new_tab(self.home_url, switch=True)),
+            ("Tab duplizieren", self.duplicate_current_tab),
+            ("Geschlossenen Tab wiederherstellen", self.reopen_last_closed_tab),
+            ("Tabs durchsuchen", self.search_tabs),
+            ("Download-Ordner öffnen", self.open_download_folder),
+            ("Seitenleiste ein/aus", self.toggle_sidebar),
+            ("Dark Mode umschalten", lambda: self.dark_mode_action.trigger()),
+            ("Vollbild umschalten", lambda: self.fullscreen_action.trigger()),
+            ("Tastenkürzel anzeigen", self.show_shortcuts_help),
+        ]
+        labels = [label for label, _ in actions]
+        selected, ok = QInputDialog.getItem(
+            self, "Befehlspalette", "Aktion auswählen:", labels, 0, False
+        )
+        if not ok or not selected:
+            return
+        selected_idx = labels.index(selected)
+        actions[selected_idx][1]()
+
+    def search_tabs(self):
+        if self.tabs.count() == 0:
+            return
+        labels = []
+        indexes = []
+        for idx in range(self.tabs.count()):
+            tab = self.tabs.widget(idx)
+            if not isinstance(tab, QWebEngineView):
+                continue
+            title = tab.title().strip() or tab.url().toString() or "Neuer Tab"
+            pin = " 📌" if bool(tab.property("pinned")) else ""
+            labels.append(f"{idx + 1}. {title[:80]}{pin}")
+            indexes.append(idx)
+        if not labels:
+            return
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Tabs durchsuchen",
+            "Schnell zu Tab springen:",
+            labels,
+            max(0, min(self.tabs.currentIndex(), len(labels) - 1)),
+            False,
+        )
+        if not ok or not selected:
+            return
+        self.tabs.setCurrentIndex(indexes[labels.index(selected)])
+
+    def show_shortcuts_help(self):
+        text = (
+            "⌘/Ctrl+T  Neuer Tab\n"
+            "⌘/Ctrl+W  Tab schließen\n"
+            "⌘/Ctrl+L  Adressleiste fokussieren\n"
+            "⌘/Ctrl+K  Befehlspalette öffnen\n"
+            "⌘/Ctrl+Shift+K  Tabs durchsuchen\n"
+            "⌘/Ctrl+D  Lesezeichen hinzufügen\n"
+            "⌘/Ctrl+Shift+T  Geschlossenen Tab wiederherstellen\n"
+            "⌘/Ctrl+J  Download-Ordner öffnen\n"
+            "⌘/Ctrl+M  Tab stummschalten\n"
+            "⌘/Ctrl+/  Diese Hilfe anzeigen"
+        )
+        QInputDialog.getMultiLineText(
+            self, "Tastenkürzel", "Wichtige Tastenkürzel (nur Anzeige):", text
+        )
 
     def open_local_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1137,6 +1539,14 @@ class BrowserWindow(QMainWindow):
             "\n".join(lines),
         )
 
+    def open_download_folder(self):
+        try:
+            self.download_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.download_dir)))
+        self.status_bar.showMessage("Download-Ordner geöffnet.", 2200)
+
     def clear_download_history(self):
         self.data["downloads"] = []
         self._save_data()
@@ -1254,15 +1664,66 @@ class BrowserWindow(QMainWindow):
         view = self.current_view()
         if not view:
             return
-        pinned = bool(pinned)
         idx = self.tabs.indexOf(view)
         if idx == -1:
             return
+        self._set_tab_pinned(idx, bool(pinned))
+
+    def _set_tab_pinned(self, index, pinned, show_message=True):
+        view = self.tabs.widget(index)
+        if not isinstance(view, QWebEngineView):
+            return
+        pinned = bool(pinned)
         view.setProperty("pinned", pinned)
-        self.tabs.setTabText(idx, self._tab_label_text(view)[:32])
-        self.tabs.setTabToolTip(idx, "Angeheftet" if pinned else "")
+        self.tabs.setTabText(index, self._tab_label_text(view)[:32])
+        self.tabs.setTabToolTip(index, "Angeheftet" if pinned else "")
         state = "angeheftet" if pinned else "gelöst"
-        self.status_bar.showMessage(f"Tab {state}.", 1800)
+        if show_message:
+            self.status_bar.showMessage(f"Tab {state}.", 1800)
+
+    def _show_tab_context_menu(self, position):
+        tab_bar = self.tabs.tabBar()
+        index = tab_bar.tabAt(position)
+        if index < 0:
+            return
+
+        view = self.tabs.widget(index)
+        is_pinned = bool(view.property("pinned")) if isinstance(view, QWebEngineView) else False
+        menu = QMenu(self)
+        pin_action = menu.addAction("Tab lösen" if is_pinned else "Tab anheften")
+        duplicate_action = menu.addAction("Tab duplizieren")
+        menu.addSeparator()
+        close_right_action = menu.addAction("Tabs rechts schließen")
+        close_other_action = menu.addAction("Andere Tabs schließen")
+        reopen_action = menu.addAction("Geschlossenen Tab wiederherstellen")
+        selected = menu.exec(tab_bar.mapToGlobal(position))
+        if selected == pin_action:
+            self._set_tab_pinned(index, not is_pinned)
+        elif selected == duplicate_action:
+            self.tabs.setCurrentIndex(index)
+            self.duplicate_current_tab()
+        elif selected == close_right_action:
+            self.close_tabs_to_right(index)
+        elif selected == close_other_action:
+            self.close_other_tabs(index)
+        elif selected == reopen_action:
+            self.reopen_last_closed_tab()
+
+    def close_other_tabs(self, keep_index):
+        for idx in reversed(range(self.tabs.count())):
+            if idx == keep_index:
+                continue
+            view = self.tabs.widget(idx)
+            if isinstance(view, QWebEngineView) and bool(view.property("pinned")):
+                continue
+            self.close_tab(idx)
+
+    def close_tabs_to_right(self, from_index):
+        for idx in reversed(range(from_index + 1, self.tabs.count())):
+            view = self.tabs.widget(idx)
+            if isinstance(view, QWebEngineView) and bool(view.property("pinned")):
+                continue
+            self.close_tab(idx)
 
     def toggle_fullscreen(self, enabled):
         if enabled:
@@ -1334,6 +1795,8 @@ class BrowserWindow(QMainWindow):
             ("GitHub", "https://github.com"),
             ("Gmail", "https://mail.google.com"),
             ("ChatGPT", "https://chatgpt.com"),
+            ("Stack Overflow", "https://stackoverflow.com"),
+            ("Reddit", "https://www.reddit.com"),
         ]
         card_html = "".join(
             f'<a class="card" href="{url}"><span>{label}</span><small>{url.replace("https://", "")}</small></a>'
@@ -1355,19 +1818,19 @@ class BrowserWindow(QMainWindow):
       margin: 0;
       min-height: 100vh;
       background:
-        radial-gradient(1200px 520px at 10% -10%, #d7e8ff 10%, transparent 58%),
-        radial-gradient(900px 450px at 100% 0%, #cde8ff 0%, transparent 50%),
-        linear-gradient(165deg, #e8f1ff 0%, #f6fbff 55%, #e6effc 100%);
+        radial-gradient(1200px 520px at 10% -10%, #c9e3ff 10%, transparent 58%),
+        radial-gradient(900px 450px at 100% 0%, #c8e3ff 0%, transparent 50%),
+        linear-gradient(165deg, #dce9ff 0%, #f3f8ff 55%, #d9e7fb 100%);
       display: grid;
       place-items: center;
       color: #0f1f3d;
     }}
     main {{
       width: min(980px, 93vw);
-      background: rgba(255, 255, 255, 0.82);
-      border: 1px solid #c5d6ec;
-      border-radius: 28px;
-      box-shadow: 0 24px 60px rgba(15, 33, 64, 0.16);
+      background: rgba(255, 255, 255, 0.86);
+      border: 1px solid #c0d4ee;
+      border-radius: 30px;
+      box-shadow: 0 28px 70px rgba(15, 33, 64, 0.2);
       padding: 36px;
       backdrop-filter: blur(10px);
     }}
@@ -1385,12 +1848,45 @@ class BrowserWindow(QMainWindow):
     .pill {{
       display: inline-block;
       padding: 8px 14px;
-      background: #e6f1ff;
-      border: 1px solid #b8d0f0;
+      background: #e7f2ff;
+      border: 1px solid #b4ceef;
       border-radius: 999px;
-      color: #224d8f;
+      color: #1e4a8a;
       font-size: 0.92rem;
-      margin-bottom: 24px;
+      margin-bottom: 18px;
+    }}
+    .search-wrap {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      margin-bottom: 22px;
+    }}
+    .search-wrap input {{
+      border: 1px solid #b5cae7;
+      border-radius: 14px;
+      padding: 12px 14px;
+      font-size: 1rem;
+      outline: none;
+      color: #15325c;
+      background: #ffffff;
+    }}
+    .search-wrap input:focus {{
+      border-color: #6b9de0;
+      box-shadow: 0 0 0 3px rgba(97, 143, 208, 0.2);
+    }}
+    .search-wrap button {{
+      border: 1px solid #5c88ca;
+      border-radius: 14px;
+      padding: 0 18px;
+      background: linear-gradient(180deg, #7eb0f4 0%, #5f93dc 100%);
+      color: #ffffff;
+      font-size: 0.98rem;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .search-wrap button:hover {{
+      filter: brightness(1.02);
+      transform: translateY(-1px);
     }}
     .grid {{
       display: grid;
@@ -1427,10 +1923,36 @@ class BrowserWindow(QMainWindow):
 <body>
   <main>
     <h1>CodexBrowser</h1>
-    <p>Schneller Start mit deinen wichtigsten Seiten.</p>
+    <p>Schneller Start mit deinen wichtigsten Seiten und smarter Suche.</p>
     <div class="pill">Cookies und Website-Logins werden gespeichert (außer im privaten Modus)</div>
+    <div class="search-wrap">
+      <input id="startSearch" type="text" placeholder="Websuche oder URL eingeben …" />
+      <button type="button" onclick="openFromStart()">Los</button>
+    </div>
     <section class="grid">{card_html}</section>
   </main>
+  <script>
+    const input = document.getElementById("startSearch");
+    function normalizeTarget(text) {{
+      const raw = text.trim();
+      if (!raw) return "";
+      if (raw.includes("://") || raw.startsWith("file://")) return raw;
+      if (raw.includes(" ")) return "https://www.google.com/search?q=" + encodeURIComponent(raw);
+      if (raw.includes(".")) return "https://" + raw;
+      return "https://www.google.com/search?q=" + encodeURIComponent(raw);
+    }}
+    function openFromStart() {{
+      const target = normalizeTarget(input.value || "");
+      if (!target) return;
+      window.location.href = target;
+    }}
+    input.addEventListener("keydown", (event) => {{
+      if (event.key === "Enter") {{
+        event.preventDefault();
+        openFromStart();
+      }}
+    }});
+  </script>
 </body>
 </html>
 """
@@ -1439,9 +1961,14 @@ class BrowserWindow(QMainWindow):
         self.sidebar.setVisible(not self.sidebar.isVisible())
 
     def _on_load_progress(self, value):
-        self.progress_label.setText(f"{value}%")
-        if value >= 100:
-            self.progress_label.setText("")
+        value = max(0, min(100, int(value)))
+        self.progress_bar.setValue(value)
+        if value < 100:
+            self.progress_bar.show()
+            self.progress_label.setText("Lädt…")
+            return
+        self.progress_bar.hide()
+        self.progress_label.setText("Bereit")
 
     def _on_download_requested(self, download: QWebEngineDownloadRequest):
         if download.state() != QWebEngineDownloadRequest.DownloadState.DownloadRequested:
@@ -1515,7 +2042,7 @@ class BrowserWindow(QMainWindow):
                 "at": datetime.now().isoformat(timespec="seconds"),
             },
         )
-        self.data["downloads"] = self.data["downloads"][:500]
+        self.data["downloads"] = self.data["downloads"][:MAX_DOWNLOAD_ITEMS]
         self._save_data()
         self.open_downloads.pop(key, None)
 
